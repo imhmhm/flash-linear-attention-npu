@@ -119,6 +119,31 @@ protected:
         (runModeKey == CAUSAL_CONV1D_TPL_RUN_MODE_FN) && (kTemplateWidth >= 2) && (kTemplateWidth <= MAX_WIDTH);
     static constexpr FnExecutionPlan kFnExecutionPlan = static_cast<FnExecutionPlan>(fnPlanKey);
 
+    // Generic-width FN instantiations (width 5..MAX_WIDTH_RT) carry no compile-time
+    // width: InitSharedBuffersAndEvents resizes the ring to (width+1) slots pitched
+    // by baseDim, and every generic-path helper below reads the two members. All
+    // other instantiations keep the fixed (RING_SLOTS, MAX_BLOCK_DIM) geometry.
+    static constexpr bool kUseRuntimeWidthLayout = (!kHasCompileTimeWidth) && (!kIsUpdateMode);
+    static constexpr int32_t kRingEventCnt = kUseRuntimeWidthLayout ? (MAX_WIDTH_RT + 1) : RING_SLOTS;
+
+    __aicore__ inline int32_t RingSlotCurr(int32_t t) const
+    {
+        return (t + ringSlots_ - 2) % ringSlots_;
+    }
+    __aicore__ inline int32_t RingSlotHist(int32_t t, int32_t i) const
+    {
+        return (t + ringSlots_ - 2 - i) % ringSlots_;
+    }
+    __aicore__ inline int32_t RingSlotPrefetch(int32_t t) const
+    {
+        return (t + ringSlots_ - 1) % ringSlots_;
+    }
+    __aicore__ inline int32_t RingRetreatSlot(int32_t slot, int32_t delta) const
+    {
+        const int32_t prev = slot - delta;
+        return (prev >= 0) ? prev : (prev + ringSlots_);
+    }
+
     __aicore__ inline void ResetRuntimeState(const CausalConv1dTilingData *tilingData);
     __aicore__ inline void InitSharedBuffersAndEvents();
     __aicore__ inline void LoadWeightAndBias(int32_t channelStart, int32_t baseDim);
@@ -191,7 +216,7 @@ protected:
 
     TEventID weightBiasMte2ToVEvent_;
     TEventID stateMte2ToVEvent_;
-    TEventID inputMte2ToVEvent_[RING_SLOTS];
+    TEventID inputMte2ToVEvent_[kRingEventCnt];
     TEventID inputVToMte2Event_;
     TEventID rollingPairVToMte2Event_[2];
     TEventID outMte3ToVEvent_[2];
@@ -225,6 +250,11 @@ protected:
     GlobalTensor<int32_t> initStateSyncGm_;
     GlobalTensor<T> initStateWorkspaceGm_;
 
+    // Ring geometry: fixed (RING_SLOTS, MAX_BLOCK_DIM) for every instantiation
+    // except runtime-width FN (kUseRuntimeWidthLayout), which resizes both in
+    // InitSharedBuffersAndEvents to (width+1, baseDim).
+    int32_t ringSlots_{RING_SLOTS};
+    int32_t slotPitch_{MAX_BLOCK_DIM};
     const CausalConv1dTilingData *tilingData_{nullptr};
 };
 
@@ -237,9 +267,22 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ResetRuntimeState(const CausalConv1d
 template <CAUSAL_CONV1D_TEMPLATE_ARGS>
 __aicore__ inline void CAUSAL_CONV1D_CLASS::InitSharedBuffersAndEvents()
 {
-    pipe.InitBuffer(inBuf, RING_SLOTS * MAX_BLOCK_DIM * sizeof(T));
-    pipe.InitBuffer(outBuf, 2 * MAX_BLOCK_DIM * sizeof(T));
-    pipe.InitBuffer(calcBuf, (MAX_WIDTH + 4) * MAX_BLOCK_DIM * sizeof(float));
+    if constexpr (kUseRuntimeWidthLayout) {
+        // width+1 ring slots + 2 out slots + (width+4) fp32 calc slots, all at a
+        // baseDim pitch sized by the tiling plan (baseDim is host-validated to
+        // fit UB for this width).
+        const int32_t width = static_cast<int32_t>(tilingData_->width);
+        const int32_t baseDim = static_cast<int32_t>(tilingData_->baseDim);
+        ringSlots_ = width + 1;
+        slotPitch_ = baseDim;
+        pipe.InitBuffer(inBuf, ringSlots_ * slotPitch_ * sizeof(T));
+        pipe.InitBuffer(outBuf, 2 * slotPitch_ * sizeof(T));
+        pipe.InitBuffer(calcBuf, (width + 4) * slotPitch_ * sizeof(float));
+    } else {
+        pipe.InitBuffer(inBuf, RING_SLOTS * MAX_BLOCK_DIM * sizeof(T));
+        pipe.InitBuffer(outBuf, 2 * MAX_BLOCK_DIM * sizeof(T));
+        pipe.InitBuffer(calcBuf, (MAX_WIDTH + 4) * MAX_BLOCK_DIM * sizeof(float));
+    }
     AllocEvents();
 }
 
@@ -248,7 +291,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::AllocEvents()
 {
     weightBiasMte2ToVEvent_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
     stateMte2ToVEvent_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
-    for (int32_t i = 0; i < RING_SLOTS; ++i) {
+    for (int32_t i = 0; i < kRingEventCnt; ++i) {
         inputMte2ToVEvent_[i] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
     }
     inputVToMte2Event_ = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
@@ -278,7 +321,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ReleaseEvents()
 {
     GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(weightBiasMte2ToVEvent_);
     GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(stateMte2ToVEvent_);
-    for (int32_t i = 0; i < RING_SLOTS; ++i) {
+    for (int32_t i = 0; i < kRingEventCnt; ++i) {
         GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(inputMte2ToVEvent_[i]);
     }
     GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(inputVToMte2Event_);
@@ -308,9 +351,9 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
 {
     const int32_t dim = tilingData_->dim;
     const int32_t width = static_cast<int32_t>(tilingData_->width);
-    const int32_t jStart = MAX_WIDTH - width;
+    const int32_t jStart = ringSlots_ - 1 - width;
     const bool hasBias = HasBias();
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, jStart + width, slotPitch_);
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &biasF = cl.biasF;
     LocalTensor<T> weightT;
@@ -319,11 +362,11 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
     if constexpr (!std::is_same<T, float>::value) {
 
         weightT = inBuf.Get<T>();
-        biasT = weightT[MAX_WIDTH * MAX_BLOCK_DIM];
+        biasT = weightT[(jStart + width) * slotPitch_];
     }
 
     for (int32_t j = 0; j < jStart; ++j) {
-        Duplicate(weightF[j * MAX_BLOCK_DIM], 0.0f, baseDim);
+        Duplicate(weightF[j * slotPitch_], 0.0f, baseDim);
     }
 
     for (int32_t j = 0; j < width; ++j) {
@@ -331,9 +374,9 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
         const int64_t weightOffset = static_cast<int64_t>(j) * dim + channelStart;
 
         if constexpr (std::is_same<T, float>::value) {
-            DataCopy(weightF[jDst * MAX_BLOCK_DIM], weightGm[weightOffset], baseDim);
+            DataCopy(weightF[jDst * slotPitch_], weightGm[weightOffset], baseDim);
         } else {
-            DataCopy(weightT[jDst * MAX_BLOCK_DIM], weightGm[weightOffset], baseDim);
+            DataCopy(weightT[jDst * slotPitch_], weightGm[weightOffset], baseDim);
         }
     }
 
@@ -351,7 +394,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
     if constexpr (!std::is_same<T, float>::value) {
         for (int32_t j = 0; j < width; ++j) {
             const int32_t jDst = jStart + j;
-            Cast(weightF[jDst * MAX_BLOCK_DIM], weightT[jDst * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+            Cast(weightF[jDst * slotPitch_], weightT[jDst * slotPitch_], RoundMode::CAST_NONE, baseDim);
         }
         if (hasBias) {
             Cast(biasF, biasT, RoundMode::CAST_NONE, baseDim);
@@ -379,11 +422,11 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
     const int64_t convStateStride0 = tilingData_->convStateStride0;
     const int64_t convStateStride1 = tilingData_->convStateStride1;
     const int32_t width = static_cast<int32_t>(tilingData_->width);
-    const int32_t ringStart = MAX_WIDTH - width;
+    const int32_t ringStart = ringSlots_ - 1 - width;
     LocalTensor<T> ring = inBuf.Get<T>();
 
     for (int32_t i = 0; i < ringStart; ++i) {
-        Duplicate(ring[i * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+        Duplicate(ring[i * slotPitch_], static_cast<T>(0), baseDim);
     }
     if (ringStart > 0) {
         PipeBarrier<PIPE_V>();
@@ -394,23 +437,23 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
             const int32_t pos = stateTokenOffset + i;
             const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * convStateStride0 +
                                         static_cast<int64_t>(pos) * convStateStride1 + channelStart;
-            DataCopy(ring[(ringStart + i) * MAX_BLOCK_DIM], convStatesGm[stateOffset], baseDim);
+            DataCopy(ring[(ringStart + i) * slotPitch_], convStatesGm[stateOffset], baseDim);
         }
 
         SetFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
         WaitFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
     } else {
         for (int32_t i = 0; i < (width - 1); ++i) {
-            Duplicate(ring[(ringStart + i) * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+            Duplicate(ring[(ringStart + i) * slotPitch_], static_cast<T>(0), baseDim);
         }
 
         PipeBarrier<PIPE_V>();
     }
 
     if (len > 0) {
-        const int32_t slot0 = SlotCurr(0);
+        const int32_t slot0 = RingSlotCurr(0);
         const int64_t xOffset = static_cast<int64_t>(start) * dim + channelStart;
-        DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
+        DataCopy(ring[slot0 * slotPitch_], xGm[xOffset], baseDim);
 
         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
     }
@@ -471,8 +514,9 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
     }
 
     const int32_t width = static_cast<int32_t>(tilingData_->width);
-    const int32_t jStart = MAX_WIDTH - width;
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    const int32_t jStart = ringSlots_ - 1 - width;
+    const int32_t jEnd = ringSlots_ - 1;
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, jEnd, slotPitch_);
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &biasF = cl.biasF;
     LocalTensor<float> &accF = cl.accF;
@@ -482,15 +526,15 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
     const bool hasBias = HasBias();
     const bool hasActivation = HasActivation();
     for (int32_t t = 0; t < len; ++t) {
-        const int32_t slotCurr = SlotCurr(t);
+        const int32_t slotCurr = RingSlotCurr(t);
 
         WaitFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotCurr]);
 
         if (t + 1 < len) {
-            const int32_t slotNext = SlotPrefetch(t);
+            const int32_t slotNext = RingSlotPrefetch(t);
             const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
-            DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
+            DataCopy(ring[slotNext * slotPitch_], xGm[xOffsetNext], baseDim);
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
         }
 
@@ -502,16 +546,16 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
             accInitialized = true;
         }
 
-        for (int32_t j = jStart; j < MAX_WIDTH; ++j) {
-            const int32_t tap = (MAX_WIDTH - 1) - j;
-            const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap);
-            Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        for (int32_t j = jStart; j < jEnd; ++j) {
+            const int32_t tap = (jEnd - 1) - j;
+            const int32_t slot = (tap == 0) ? slotCurr : RingSlotHist(t, tap);
+            Cast(tmpF, ring[slot * slotPitch_], RoundMode::CAST_NONE, baseDim);
             PipeBarrier<PIPE_V>();
             if (!accInitialized) {
-                Mul(accF, tmpF, weightF[j * MAX_BLOCK_DIM], baseDim);
+                Mul(accF, tmpF, weightF[j * slotPitch_], baseDim);
                 accInitialized = true;
             } else {
-                MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], baseDim);
+                MulAddDst(accF, tmpF, weightF[j * slotPitch_], baseDim);
             }
         }
 
@@ -522,7 +566,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
         }
 
         const int32_t outSlot = t & 1;
-        LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
+        LocalTensor<T> outSlotT = outT[outSlot * slotPitch_];
         if (t >= 2) {
 
             WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
@@ -899,14 +943,14 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackState(int32_t cacheIdx, int
 
     const int32_t lastT = len - 1;
     LocalTensor<T> ring = inBuf.Get<T>();
-    const int32_t lastSlot = SlotCurr(lastT);
+    const int32_t lastSlot = RingSlotCurr(lastT);
     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * convStateStride0 + channelStart;
 
     for (int32_t pos = 0; pos < (width - 1); ++pos) {
         const int32_t tap = (width - 2) - pos;
-        const int32_t slot = RetreatRingSlot(lastSlot, tap);
+        const int32_t slot = RingRetreatSlot(lastSlot, tap);
         const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(pos) * convStateStride1;
-        DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], baseDim);
+        DataCopy(convStatesGm[stateOffset], ring[slot * slotPitch_], baseDim);
     }
 }
 
@@ -1231,7 +1275,8 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessDefaultByWindowMode()
     const uint32_t blockIdx = GetBlockIdx();
     const uint32_t blockNum = GetBlockNum();
 
-    if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_BLOCK_DIM || width < 2 || width > MAX_WIDTH) {
+    const int32_t maxSupportedWidth = kUseRuntimeWidthLayout ? MAX_WIDTH_RT : MAX_WIDTH;
+    if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_BLOCK_DIM || width < 2 || width > maxSupportedWidth) {
         ReleaseEvents();
         return;
     }
@@ -1319,7 +1364,9 @@ __aicore__ inline bool CAUSAL_CONV1D_CLASS::IsUpdateMode() const
 template <CAUSAL_CONV1D_TEMPLATE_ARGS>
 __aicore__ inline bool CAUSAL_CONV1D_CLASS::IsFnRollingFastPathEnabled() const
 {
-    return !kIsUpdateMode && (tilingData_ != nullptr) && (kFnExecutionPlan != FN_EXECUTION_PLAN_INVALID) &&
+    // The rolling fast path is implemented only for compile-time widths; generic
+    // runtime-width instantiations must stay on the generic RunSeq path.
+    return kHasCompileTimeWidth && (tilingData_ != nullptr) && (kFnExecutionPlan != FN_EXECUTION_PLAN_INVALID) &&
            (tilingData_->hasNumAcceptedTokens == 0) && !HasBias();
 }
 

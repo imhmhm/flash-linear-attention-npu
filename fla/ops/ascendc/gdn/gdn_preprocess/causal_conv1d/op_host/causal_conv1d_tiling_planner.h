@@ -89,14 +89,13 @@ inline int64_t ResolveFnTokenCoreBudget(int64_t baseDimCnt, FnExecutionPlan fnEx
 inline VarlenTokenTileChoice ChooseFnTokenBlockChoice(int64_t cuSeqlen, int64_t baseDimCnt,
                                                       FnExecutionPlan fnExecutionPlan, uint32_t coreNum);
 
-inline int64_t ComputeFnUbLimitedBaseDim(uint64_t ubSize)
+inline int64_t ComputeFnUbLimitedBaseDim(uint64_t ubSize, int64_t width)
 {
-    if (ubSize <= static_cast<uint64_t>(FN_UB_RESERVED_BYTES)) {
+    if (ubSize <= static_cast<uint64_t>(FN_UB_RESERVED_BYTES) || width <= 0) {
         return 0;
     }
 
-    const int64_t bytesPerElem = (RING_SLOT_CNT * BF16_FP16_ELEM_BYTES) + (FN_OUT_SLOT_CNT * BF16_FP16_ELEM_BYTES) +
-                                 (FN_CALC_FP32_SLOT_CNT * static_cast<int64_t>(sizeof(float)));
+    const int64_t bytesPerElem = FnBytesPerDimElem(width);
     const int64_t budgetBytes = static_cast<int64_t>(ubSize) - FN_UB_RESERVED_BYTES;
     const int64_t ubLimitedBaseDim = AlignDownInt64(budgetBytes / bytesPerElem, DIM_ALIGN_ELEMS);
     return std::min<int64_t>(MAX_DIM_TILE_SIZE, ubLimitedBaseDim);
@@ -111,13 +110,13 @@ inline DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim)
 }
 
 inline DimTileChoice ChooseFnTokenDimCoSplitBaseDimChoice(gert::TilingContext *context, int64_t dim, uint64_t ubSize,
-                                                          uint32_t coreNum)
+                                                          uint32_t coreNum, int64_t width)
 {
     if (dim <= 0) {
         return {};
     }
 
-    const int64_t ubLimitedBaseDim = ComputeFnUbLimitedBaseDim(ubSize);
+    const int64_t ubLimitedBaseDim = ComputeFnUbLimitedBaseDim(ubSize, width);
     if (ubLimitedBaseDim <= 0) {
         OP_LOGD(context, "FnDimCoSplit: UB budget is too small to form a valid baseDim.");
         return {};
@@ -267,14 +266,17 @@ inline FnHostPlan ChooseFnHostPlan(gert::TilingContext *context, const CausalCon
         return plan;
     }
 
-    if (tiling.dim <= MAX_DIM_TILE_SIZE) {
+    // token_first keeps one full-dim tile per block; for runtime widths the UB
+    // footprint grows with width (FnBytesPerDimElem), so only take token_first
+    // when the whole dim fits the width-specific budget.
+    if (tiling.dim <= MAX_DIM_TILE_SIZE && tiling.dim <= ComputeFnUbLimitedBaseDim(ubSize, tiling.width)) {
         plan.caseKind = FN_TILING_CASE_TOKEN_FIRST;
         plan.executionPlan = FN_EXECUTION_PLAN_CUTBS;
         plan.baseDimChoice = ChooseFnTokenFirstBaseDimChoice(tiling.dim);
     } else {
         plan.caseKind = FN_TILING_CASE_TOKEN_DIM_CO_SPLIT;
         plan.executionPlan = FN_EXECUTION_PLAN_CUTBSD;
-        plan.baseDimChoice = ChooseFnTokenDimCoSplitBaseDimChoice(context, tiling.dim, ubSize, coreNum);
+        plan.baseDimChoice = ChooseFnTokenDimCoSplitBaseDimChoice(context, tiling.dim, ubSize, coreNum, tiling.width);
     }
 
     if (plan.baseDimChoice.baseDim <= 0 || plan.baseDimChoice.baseDimCnt <= 0) {

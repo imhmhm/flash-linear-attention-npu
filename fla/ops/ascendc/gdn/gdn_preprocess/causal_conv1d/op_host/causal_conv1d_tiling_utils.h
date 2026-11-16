@@ -121,9 +121,20 @@ constexpr int64_t BF16_FP16_ELEM_BYTES = 2;
 constexpr int64_t DIM_ALIGN_ELEMS = DIM_ALIGN_BYTES / BF16_FP16_ELEM_BYTES;
 constexpr int64_t MAX_DIM_TILE_SIZE = 4096;
 constexpr int64_t FN_UB_RESERVED_BYTES = 512;
-constexpr int64_t RING_SLOT_CNT = 5;
 constexpr int64_t FN_OUT_SLOT_CNT = 2;
-constexpr int64_t FN_CALC_FP32_SLOT_CNT = 8;
+// Update/decode keeps the specialized [2,4] kernels; the FN runtime-width
+// generic layout covers widths up to MAX_FN_WIDTH (width+1 ring slots at a
+// baseDim pitch, mirrored on device by kUseRuntimeWidthLayout).
+constexpr int64_t MAX_UPDATE_WIDTH = 4;
+constexpr int64_t MAX_FN_WIDTH = 8;
+
+// UB bytes per baseDim element for the FN layouts: (width+1) bf16 ring slots +
+// 2 bf16 out slots + (width+4) fp32 calc slots. width=4 reproduces the
+// specialized-layout budget (5*2 + 2*2 + 8*4 = 46).
+inline constexpr int64_t FnBytesPerDimElem(int64_t width)
+{
+    return ((width + 1) + FN_OUT_SLOT_CNT) * BF16_FP16_ELEM_BYTES + (width + 4) * static_cast<int64_t>(sizeof(float));
+}
 
 inline constexpr uint32_t NormalizeFnPlanTilingKey(uint32_t runModeKey, FnExecutionPlan fnExecutionPlan)
 {

@@ -20,6 +20,9 @@
 namespace NsCausalConv1dCommon {
 
 constexpr int32_t MAX_WIDTH = 4;
+// Upper bound of the runtime-width FN layout (widths 5..8 have no compile-time
+// specialization and run on the generic path with a width-sized ring buffer).
+constexpr int32_t MAX_WIDTH_RT = 8;
 constexpr int32_t MAX_BLOCK_DIM = 4096;
 
 constexpr int32_t RING_SLOTS = 5;
@@ -50,13 +53,21 @@ struct CalcBufLayout {
 
     __aicore__ static inline CalcBufLayout FromCalcBuf(AscendC::TBuf<AscendC::QuePosition::VECCALC> &calcBuf)
     {
+        return FromCalcBuf(calcBuf, MAX_WIDTH, MAX_BLOCK_DIM);
+    }
+
+    // Runtime-width layout: the weight region is [0, weightSlots) at the given
+    // slot pitch; bias/acc/tmp/curr follow at one slot each.
+    __aicore__ static inline CalcBufLayout FromCalcBuf(AscendC::TBuf<AscendC::QuePosition::VECCALC> &calcBuf,
+                                                       int32_t weightSlots, int32_t pitch)
+    {
         CalcBufLayout layout;
         AscendC::LocalTensor<float> calc = calcBuf.template Get<float>();
         layout.weightF = calc;
-        layout.biasF = calc[MAX_WIDTH * MAX_BLOCK_DIM];
-        layout.accF = layout.biasF[MAX_BLOCK_DIM];
-        layout.tmpF = layout.accF[MAX_BLOCK_DIM];
-        layout.currF = layout.tmpF[MAX_BLOCK_DIM];
+        layout.biasF = calc[weightSlots * pitch];
+        layout.accF = layout.biasF[pitch];
+        layout.tmpF = layout.accF[pitch];
+        layout.currF = layout.tmpF[pitch];
         return layout;
     }
 };

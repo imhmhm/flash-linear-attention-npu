@@ -337,8 +337,10 @@ inline ge::graphStatus GetShapeDtypeInfo(gert::TilingContext *context, const Cau
         OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(context->GetNodeName(), "weight", "invalid", "weight.shape[1] must equal dim");
         return ge::GRAPH_FAILED;
     }
-    if (width < 2 || width > 4) {
-        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "actually", std::to_string(width), "Only support width in [2,4] now, actually is d.");
+    const int64_t maxWidth = isDecodeMode ? MAX_UPDATE_WIDTH : MAX_FN_WIDTH;
+    if (width < 2 || width > maxWidth) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "actually", std::to_string(width),
+                                              "Only support width in [2,4] for update and [2,8] for fn now, actually is d.");
         return ge::GRAPH_FAILED;
     }
 

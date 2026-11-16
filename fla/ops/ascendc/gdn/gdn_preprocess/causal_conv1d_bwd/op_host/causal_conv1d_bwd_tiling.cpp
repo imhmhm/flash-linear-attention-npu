@@ -582,7 +582,12 @@ static ge::graphStatus CausalConv1dBwdTilingFunc(gert::TilingContext *context)
         }
     }
 
-    if (isAscend950 && !useArch35DirectFast && !use910BDirectFast) {
+    // UB-shrink halving on the normal (chunked) path: was ascend950-only,
+    // which left 910B with no fallback when the width-dependent budget
+    // (wBtBdAl = W*BT*BD fp32 stage) outgrew UB — the runtime widths > 4 then
+    // failed the capacity check below. W<=4 on 910B never exceeds the budget,
+    // so the loop is a no-op there (bitwise-identical tiling).
+    if (!useArch35DirectFast && !use910BDirectFast) {
         while (BT > 1U && CalcNormalNeed(BT) > ubSize) {
             BT >>= 1U;
         }
